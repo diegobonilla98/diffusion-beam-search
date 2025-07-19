@@ -2,6 +2,8 @@
 
 This project explores advanced sampling techniques for diffusion models that go beyond the standard reverse diffusion process. By implementing search-based methods like Best-of-N sampling and Beam Search, we aim to improve image generation quality by allowing the model to explore more of the generation space and select optimal paths.
 
+![](./best_of_n.png)
+
 ## 🎯 Project Overview
 
 Traditional diffusion models follow a deterministic reverse sampling process, generating images step-by-step from noise to final output. This project investigates whether **search-based sampling methods** can improve generation quality by:
