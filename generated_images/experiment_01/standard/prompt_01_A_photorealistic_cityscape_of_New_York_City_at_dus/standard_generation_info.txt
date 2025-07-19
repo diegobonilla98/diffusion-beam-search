@@ -1,0 +1,4 @@
+Prompt: A photorealistic cityscape of New York City at dusk, with wet streets reflecting neon lights, bustling crowds, and detailed skyscrapers, cinematic lighting
+Method: standard
+Generation time: 19.66 seconds
+Use stochastic scheduler: False

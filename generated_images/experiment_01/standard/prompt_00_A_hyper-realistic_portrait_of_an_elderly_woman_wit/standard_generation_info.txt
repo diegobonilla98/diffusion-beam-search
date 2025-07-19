@@ -1,0 +1,4 @@
+Prompt: A hyper-realistic portrait of an elderly woman with weathered skin, sitting in a cozy wooden cabin, sunlight streaming through a window, soft shadows, 8k resolution, photorealistic
+Method: standard
+Generation time: 21.20 seconds
+Use stochastic scheduler: False
