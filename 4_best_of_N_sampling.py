@@ -1,4 +1,5 @@
-from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler
+from diffusers import AutoencoderKL, UNet2DConditionModel
+from scheduling_ddpm import DDPMScheduler, diverse_randn_tensor
 from transformers import CLIPTextModel, CLIPTokenizer
 import math
 import torch
@@ -128,57 +129,49 @@ for step_idx, t in enumerate(tqdm(timesteps)):
     score_estimate = -noise_pred_float / sqrt_one_minus_alpha_prod_t
     score_estimates.append(score_estimate.clone())
 
-    # --- Corrected explicit computation for the previous noisy sample x_{t-1} ---
-    # This block correctly replicates the behavior of scheduler.step() for DDPM
-    # with the default variance_type="fixed_small", accounting for subsampled timesteps.
-
-    # 1. Get the previous timestep
+    # Use the custom scheduler step implementation
+    # The scheduler will handle all the computation internally
+    
+    # Get the previous timestep for NLL computation
     prev_t = scheduler.previous_timestep(t)
-
-    # 2. Get alpha_prod for the previous timestep
+    
+    # Get beta_prod_t_prev for variance calculation
     if prev_t >= 0:
         alpha_prod_t_prev = alphas_cumprod[prev_t.item()]
+        beta_prod_t_prev = 1 - alpha_prod_t_prev
     else:
-        # This case is for the final step where t=0, so prev_t is < 0.
-        # alpha_prod_t_prev is set to 1.0, making the variance term zero.
-        alpha_prod_t_prev = torch.tensor(1.0, device=device, dtype=dtype)
+        beta_prod_t_prev = torch.tensor(0.0, device=device, dtype=dtype)
 
-    # 3. Compute effective alpha_t and beta_t for the current step transition
-    # This is crucial for subsampled timesteps, as alpha_t is not simply alphas[t_idx]
-    current_alpha_t = alpha_prod_t / alpha_prod_t_prev
-    current_beta_t = 1 - current_alpha_t
-
-    # 4. Compute the mean of the posterior q(x_{t-1} | x_t, x_0)
-    # This is the "pred_prev_sample" part of the scheduler's step function.
-    # We use the alternative formulation based on pred_original_sample, which is more direct.
-    beta_prod_t_prev = 1 - alpha_prod_t_prev
-    
-    # Coefficients for pred_original_sample and current sample x_t
-    pred_original_sample_coeff = (torch.sqrt(alpha_prod_t_prev) * current_beta_t) / beta_prod_t
-    current_sample_coeff = (torch.sqrt(current_alpha_t) * beta_prod_t_prev) / beta_prod_t
-
-    # Compute the mean
-    pred_prev_sample = pred_original_sample_coeff * pred_original_sample + current_sample_coeff * latents
-
-    # 5. Compute the variance and standard deviation of the posterior
-    # This corresponds to the scheduler's _get_variance method for "fixed_small"
-    variance = (beta_prod_t_prev / beta_prod_t) * current_beta_t
-    # Clamp variance to prevent division by zero or log(0) issues
-    variance = torch.clamp(variance, min=1e-20)
-    std_dev_t = torch.sqrt(variance)
-
-    # 6. Add noise to get the final x_{t-1} sample
-    # Noise is only added if not on the final step (t > 0)
+    # 6. Use custom scheduler step with diverse noise sampling
     if prev_t >= 0:
-        # Compute variance_prev for NLL calculations
+        # Compute variance_prev for NLL calculations  
         variance_prev = beta_prod_t_prev.item()
+
+        # Generate N diverse noise samples using diverse_randn_tensor
+        diverse_noise = diverse_randn_tensor(
+            shape=latents.shape[1:],
+            N=N,
+            generator=generator,
+            device=device,
+            dtype=dtype
+        )
 
         # Generate N candidates and choose the best based on forward NLL at prev_t
         min_nll = float('inf')
         best_latents = None
-        for _ in range(N):
-            noise = torch.randn_like(latents)
-            candidate_latents = pred_prev_sample + std_dev_t * noise
+        for i in range(N):
+            noise = diverse_noise[i:i+1]  # Get i-th noise sample with batch dimension
+            
+            # Use custom scheduler step with the diverse noise
+            step_output = scheduler.step(
+                model_output=noise_pred,
+                timestep=t,
+                sample=latents,
+                generator=generator,
+                return_dict=True,
+                random_noise=noise
+            )
+            candidate_latents = step_output.prev_sample
 
             # Compute NLL for this candidate at prev_t
             latent_model_input = torch.cat([candidate_latents] * 2)
@@ -196,7 +189,15 @@ for step_idx, t in enumerate(tqdm(timesteps)):
                 best_latents = candidate_latents
         latents = best_latents
     else:
-        latents = pred_prev_sample  # No noise added
+        # Use custom scheduler step without noise for final step
+        step_output = scheduler.step(
+            model_output=noise_pred,
+            timestep=t,
+            sample=latents,
+            generator=generator,
+            return_dict=True
+        )
+        latents = step_output.prev_sample
 
 # After the loop: `scores` is a Python list of length = num_inference_steps
 print("Per-step forward NLL (per element, lower better - measures prediction quality):")

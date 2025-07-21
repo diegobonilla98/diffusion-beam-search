@@ -13,7 +13,8 @@ NLL = 0.5 * log(2π * variance_t) + 0.5 * (||ε_pred||² / d)
 Where lower values indicate better predictions (ε_pred closer to unit variance).
 """
 
-from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler
+from diffusers import AutoencoderKL, UNet2DConditionModel
+from scheduling_ddpm import DDPMScheduler, diverse_randn_tensor
 from transformers import CLIPTextModel, CLIPTokenizer
 import math
 import torch
@@ -136,50 +137,54 @@ for step_idx, t in enumerate(tqdm(timesteps)):
     score_norms = torch.norm(score_estimate.view(batch_size, -1), dim=1).mean().item()
     score_estimates.append(score_norms)  # Store average norm
 
-    # Predict x0
-    sqrt_alpha_prod_t = torch.sqrt(alpha_prod_t)
-    pred_original_sample = (latents.float() - sqrt_one_minus_alpha_prod_t * noise_pred.float()) / sqrt_alpha_prod_t
-
-    # Clip pred_original_sample
-    pred_original_sample = torch.clamp(pred_original_sample, -1.0, 1.0)
-
-    # --- Compute the previous noisy sample x_{t-1} candidates ---
-
-    # 1. Get the previous timestep
+    # Use the custom scheduler step implementation for candidate generation
+    # Get the previous timestep
     prev_t = scheduler.previous_timestep(t)
 
-    # 2. Get alpha_prod for the previous timestep
-    if prev_t >= 0:
-        alpha_prod_t_prev = alphas_cumprod[prev_t.item()]
-    else:
-        alpha_prod_t_prev = torch.tensor(1.0, device=device, dtype=dtype)
-
-    # 3. Compute effective alpha_t and beta_t for the current step transition
-    current_alpha_t = alpha_prod_t / alpha_prod_t_prev
-    current_beta_t = 1 - current_alpha_t
-
-    # 4. Compute the mean of the posterior
-    beta_prod_t_prev = 1 - alpha_prod_t_prev
-    pred_original_sample_coeff = (torch.sqrt(alpha_prod_t_prev) * current_beta_t) / beta_prod_t
-    current_sample_coeff = (torch.sqrt(current_alpha_t) * beta_prod_t_prev) / beta_prod_t
-    pred_prev_sample = pred_original_sample_coeff * pred_original_sample + current_sample_coeff * latents
-
-    # 5. Compute the variance and standard deviation
-    variance = (beta_prod_t_prev / beta_prod_t) * current_beta_t
-    variance = torch.clamp(variance, min=1e-20)
-    std_dev_t = torch.sqrt(variance)
-
-    # 6. Generate candidates
+    # Generate candidates using custom scheduler step with diverse noise
     total_candidates = batch_size * num_candidates_per_beam
     if prev_t >= 0:
-        # Replicate pred_prev_sample
-        pred_prev_sample_rep = pred_prev_sample.repeat_interleave(num_candidates_per_beam, dim=0)
-        # Sample noises
-        noise = torch.randn((total_candidates, *latents.shape[1:]), device=device, dtype=dtype)
-        candidate_latents = pred_prev_sample_rep + std_dev_t * noise
+        # Generate diverse noise samples for all candidates
+        diverse_noise = diverse_randn_tensor(
+            shape=latents.shape[1:],  # Remove batch dimension
+            N=total_candidates,
+            generator=generator,
+            device=device,
+            dtype=dtype
+        )
+        
+        # Generate candidates by applying scheduler step with diverse noise
+        candidate_latents = []
+        for beam_idx in range(batch_size):
+            for cand_idx in range(num_candidates_per_beam):
+                noise_idx = beam_idx * num_candidates_per_beam + cand_idx
+                noise_sample = diverse_noise[noise_idx:noise_idx+1]
+                
+                # Use custom scheduler step with diverse noise
+                step_output = scheduler.step(
+                    model_output=noise_pred[beam_idx:beam_idx+1],
+                    timestep=t,
+                    sample=latents[beam_idx:beam_idx+1],
+                    generator=generator,
+                    return_dict=True,
+                    random_noise=noise_sample
+                )
+                candidate_latents.append(step_output.prev_sample)
+        
+        candidate_latents = torch.cat(candidate_latents, dim=0)
     else:
-        # No branching at last step
-        latents = pred_prev_sample
+        # No branching at last step - use scheduler step without noise
+        step_outputs = []
+        for beam_idx in range(batch_size):
+            step_output = scheduler.step(
+                model_output=noise_pred[beam_idx:beam_idx+1],
+                timestep=t,
+                sample=latents[beam_idx:beam_idx+1],
+                generator=generator,
+                return_dict=True
+            )
+            step_outputs.append(step_output.prev_sample)
+        latents = torch.cat(step_outputs, dim=0)
         continue
 
     # Evaluate candidates using lookahead
@@ -206,33 +211,36 @@ for step_idx, t in enumerate(tqdm(timesteps)):
         lookahead_nll = compute_forward_nll_batch(eval_noise_pred.float(), eval_variance_t, latent_dims)
         lookahead_scores += lookahead_nll
 
-        # Advance to next eval_latents deterministically if not last
+        # Advance to next eval_latents using custom scheduler step if not last
         if m < lookahead_steps - 1:
-            eval_sqrt_alpha_prod_t = torch.sqrt(eval_alpha_prod_t)
-            eval_sqrt_one_minus = torch.sqrt(1 - eval_alpha_prod_t)
-            eval_pred_original_sample = (eval_latents.float() - eval_sqrt_one_minus * eval_noise_pred.float()) / eval_sqrt_alpha_prod_t
-            eval_pred_original_sample = torch.clamp(eval_pred_original_sample, -1.0, 1.0)
-
             eval_prev_t = scheduler.previous_timestep(eval_timestep)
+            
             if eval_prev_t >= 0:
-                eval_alpha_prod_t_prev = alphas_cumprod[eval_prev_t.item()]
+                # Use scheduler step for deterministic advance (no noise)
+                eval_step_outputs = []
+                for i in range(total_candidates):
+                    step_output = scheduler.step(
+                        model_output=eval_noise_pred[i:i+1],
+                        timestep=eval_timestep,
+                        sample=eval_latents[i:i+1],
+                        generator=generator,
+                        return_dict=True
+                    )
+                    eval_step_outputs.append(step_output.prev_sample)
+                eval_latents = torch.cat(eval_step_outputs, dim=0)
             else:
-                eval_alpha_prod_t_prev = torch.tensor(1.0, device=device, dtype=dtype)
-
-            eval_current_alpha_t = eval_alpha_prod_t / eval_alpha_prod_t_prev
-            eval_current_beta_t = 1 - eval_current_alpha_t
-            eval_beta_prod_t_prev = 1 - eval_alpha_prod_t_prev
-
-            eval_pred_original_sample_coeff = (torch.sqrt(eval_alpha_prod_t_prev) * eval_current_beta_t) / (1 - eval_alpha_prod_t)
-            eval_current_sample_coeff = (torch.sqrt(eval_current_alpha_t) * eval_beta_prod_t_prev) / (1 - eval_alpha_prod_t)
-            eval_pred_prev_sample = eval_pred_original_sample_coeff * eval_pred_original_sample + eval_current_sample_coeff * eval_latents
-
-            eval_variance = (eval_beta_prod_t_prev / (1 - eval_alpha_prod_t)) * eval_current_beta_t
-            eval_variance = torch.clamp(eval_variance, min=1e-20)
-            eval_std_dev_t = torch.sqrt(eval_variance)
-
-            # Deterministic advance
-            eval_latents = eval_pred_prev_sample
+                # Final step - use scheduler step without noise
+                eval_step_outputs = []
+                for i in range(total_candidates):
+                    step_output = scheduler.step(
+                        model_output=eval_noise_pred[i:i+1],
+                        timestep=eval_timestep,
+                        sample=eval_latents[i:i+1],
+                        generator=generator,
+                        return_dict=True
+                    )
+                    eval_step_outputs.append(step_output.prev_sample)
+                eval_latents = torch.cat(eval_step_outputs, dim=0)
 
             eval_timestep = eval_prev_t
 

@@ -13,7 +13,8 @@ NLL = 0.5 * log(2π * variance_t) + 0.5 * (||ε_pred||² / d)
 Where lower values indicate better predictions (ε_pred closer to unit variance).
 """
 
-from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler
+from diffusers import AutoencoderKL, UNet2DConditionModel
+from scheduling_ddpm import DDPMScheduler
 from transformers import CLIPTextModel, CLIPTokenizer
 import math
 import torch
@@ -148,49 +149,8 @@ for step_idx, t in enumerate(tqdm(timesteps)):
     score_estimate = -noise_pred_float / sqrt_one_minus_alpha_prod_t
     score_estimates.append(score_estimate.clone())
 
-    # --- Corrected explicit computation for the previous noisy sample x_{t-1} ---
-    # This block correctly replicates the behavior of scheduler.step() for DDPM
-    # with the default variance_type="fixed_small", accounting for subsampled timesteps.
-
-    # 1. Get the previous timestep
-    prev_t = scheduler.previous_timestep(t)
-
-    # 2. Get alpha_prod for the previous timestep
-    if prev_t >= 0:
-        alpha_prod_t_prev = alphas_cumprod[prev_t.item()]
-    else:
-        # This case is for the final step where t=0, so prev_t is < 0.
-        # alpha_prod_t_prev is set to 1.0, making the variance term zero.
-        alpha_prod_t_prev = torch.tensor(1.0, device=device, dtype=dtype)
-
-    # 3. Compute effective alpha_t and beta_t for the current step transition
-    # This is crucial for subsampled timesteps, as alpha_t is not simply alphas[t_idx]
-    current_alpha_t = alpha_prod_t / alpha_prod_t_prev
-    current_beta_t = 1 - current_alpha_t
-
-    # 4. Compute the mean of the posterior q(x_{t-1} | x_t, x_0)
-    # This is the "pred_prev_sample" part of the scheduler's step function.
-    # We use the alternative formulation based on pred_original_sample, which is more direct.
-    beta_prod_t_prev = 1 - alpha_prod_t_prev
-    
-    # Coefficients for pred_original_sample and current sample x_t
-    pred_original_sample_coeff = (torch.sqrt(alpha_prod_t_prev) * current_beta_t) / beta_prod_t
-    current_sample_coeff = (torch.sqrt(current_alpha_t) * beta_prod_t_prev) / beta_prod_t
-
-    # Compute the mean
-    pred_prev_sample = pred_original_sample_coeff * pred_original_sample + current_sample_coeff * latents
-
-    # 5. Compute the variance and standard deviation of the posterior
-    # This corresponds to the scheduler's _get_variance method for "fixed_small"
-    variance = (beta_prod_t_prev / beta_prod_t) * current_beta_t
-    # Clamp variance to prevent division by zero or log(0) issues
-    variance = torch.clamp(variance, min=1e-20)
-    std_dev_t = torch.sqrt(variance)
-
-    # 6. Add noise to get the final x_{t-1} sample
-    # Noise is only added if not on the final step (t > 0)
-    noise = torch.randn_like(latents) if prev_t >= 0 else torch.zeros_like(latents)
-    latents = pred_prev_sample + std_dev_t * noise
+    # Compute the previous noisy sample x_{t-1}
+    latents = scheduler.step(noise_pred, t, latents).prev_sample
 
 # After the loop: `scores` is a Python list of length = num_inference_steps
 print("Per-step forward NLL (per element, lower better - measures prediction quality):")
